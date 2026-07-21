@@ -1110,8 +1110,78 @@ public class AuctionManager {
      * @param amount The amount paid
      */
     private void processBuyItNow(UUID bidderUuid, double amount) {
-        CurrencyMod.LOGGER.info("Processing buy-it-now purchase from UUID {}", bidderUuid);
-        // Just end the auction immediately - the endAuction method will handle the rest
+        CurrencyMod.LOGGER.info("Processing buy-it-now purchase from UUID {} for ${}", bidderUuid, amount);
+
+        // Follow-up fix (flagged by independent review): the old
+        // implementation just called endAuction() without deducting the
+        // bidder's money or recording the bid. endAuction would then see
+        // currentAuction.getCurrentBid() == null, fall into the no-bidder
+        // branch, and return the item to the seller -- the buyer got
+        // nothing and the seller got no money. The buy-it-now feature was
+        // silently broken (and a latent money/item dupe risk if anyone
+        // ever flipped isBuyItNow() to true without also fixing this).
+        //
+        // Currently isBuyItNow() always returns false (Auction.java:1537),
+        // so this path is dead code today. This fix makes it correct IF the
+        // feature is ever enabled, and composes with C-05 (deduct-first)
+        // and C-04 (endAuction credits seller from escrow).
+        //
+        // We run inside placeBid's synchronized(auctionLock) block (the
+        // caller holds the lock); Java intrinsic locks are reentrant, so
+        // endAuction() below can re-acquire safely.
+
+        // 1. Snapshot previous bidder (defensive -- buy-it-now should be
+        //    the first bid, but if someone managed to place a lower bid
+        //    first we should refund them).
+        UUID previousTopBidderUUID = null;
+        double previousBidAmount = 0;
+        if (currentAuction.getCurrentBid() != null) {
+            previousTopBidderUUID = currentAuction.getCurrentBid().getBidderUuid();
+            previousBidAmount = currentAuction.getCurrentBid().getBidAmount();
+        }
+
+        // 2. Deduct the buy-it-now price from the bidder FIRST (C-05 pattern).
+        //    The pre-check at placeBid line ~853 is TOCTOU; a concurrent tax
+        //    deduction could drop the balance below 'amount' between the
+        //    pre-check and here. Check the return value and abort cleanly.
+        double deductResult = economyManager.removeBalance(bidderUuid, amount);
+        if (deductResult < 0) {
+            CurrencyMod.LOGGER.info("Buy-it-now rejected: UUID {} failed escrow deduction of {} "
+                + "(balance dropped between pre-check and removeBalance)", bidderUuid, amount);
+            ServerPlayerEntity bidder = server.getPlayerManager().getPlayer(bidderUuid);
+            if (bidder != null) {
+                bidder.sendMessage(Text.literal("§6[Auction] §cYour buy-it-now purchase of §a" + amount
+                    + " §ccould not be completed: insufficient funds at escrow time."));
+            }
+            return;
+        }
+        CurrencyMod.LOGGER.info("Escrowed ${} from UUID {} for buy-it-now (new balance: {})",
+            amount, bidderUuid, deductResult);
+
+        // 3. Set the bid so endAuction's winner branch fires. Without this,
+        //    endAuction sees highestBid == null and returns the item to the
+        //    seller as "no bids" -- the buyer's escrow would be permanently
+        //    destroyed.
+        currentAuction.placeBid(bidderUuid, amount);
+
+        // 4. Refund the previous bidder if there was one (C-05 pattern).
+        if (previousTopBidderUUID != null && !previousTopBidderUUID.equals(bidderUuid)) {
+            economyManager.addBalance(previousTopBidderUUID, previousBidAmount);
+            CurrencyMod.LOGGER.info("Refunded ${} to previous top bidder after buy-it-now", previousBidAmount);
+            ServerPlayerEntity previousBidder = server.getPlayerManager().getPlayer(previousTopBidderUUID);
+            if (previousBidder != null) {
+                previousBidder.sendMessage(Text.literal("§6[Auction] §cThe auction you bid on was completed via "
+                    + "buy-it-now. §eYour bid of §a" + previousBidAmount + " §ehas been refunded."));
+            }
+        }
+
+        // 5. Persist the state so a crash between here and endAuction can
+        //    be recovered (N2-C-02).
+        saveCurrentAuction();
+
+        // 6. End the auction. The winner branch will fire (currentBid != null),
+        //    credit the seller from the escrowed funds (C-04), and deliver
+        //    the item to the buyer.
         endAuction();
     }
     
