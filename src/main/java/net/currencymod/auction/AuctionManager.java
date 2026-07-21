@@ -604,12 +604,45 @@ public class AuctionManager {
                 CurrencyMod.LOGGER.info("Auction ended with winner: {} ({}), price: ${}", 
                     buyerName, buyerUuid, price);
                 
-                // Transfer the funds from the buyer to the seller
-                boolean transferSuccess = economyManager.transferMoney(buyerUuid, sellerUuid, price);
+                // C-04 fix: credit the seller from the already-escrowed funds.
+                // The buyer's balance was deducted (escrowed) at placeBid time
+                // (see C-05 fix at line ~911). The escrowed amount is "in the
+                // system" but not credited to anyone. endAuction must therefore
+                // CREDIT the seller via addBalance(sellerUuid, price) -- it must
+                // NOT call transferMoney(buyerUuid, sellerUuid, price), which
+                // would deduct 'price' from the buyer a SECOND time. The old
+                // code did exactly that: either the buyer had enough left and
+                // the seller got paid twice (once from escrow, once from the
+                // buyer's remaining balance), or transferMoney returned false
+                // and the seller got nothing while the buyer's escrow was
+                // permanently destroyed.
+                //
+                // Composition with C-05: the C-05 fix guarantees that if
+                // currentAuction.getCurrentBid() != null (i.e. we are in this
+                // winner branch), the bidder's removeBalance succeeded at
+                // placeBid time. So addBalance(sellerUuid, price) is always
+                // correct here -- the funds are already escrowed.
+                //
+                // Defensive guard: addBalance itself cannot meaningfully fail
+                // (it sets a map value), but if the underlying economy layer
+                // ever throws (e.g. persistence error during a future refactor),
+                // we still want to return the item to the seller rather than
+                // leave the auction in an inconsistent state.
+                boolean transferSuccess;
+                try {
+                    economyManager.addBalance(sellerUuid, price);
+                    CurrencyMod.LOGGER.info("Credited seller {} with ${} from escrowed bid funds (C-04 fix)",
+                        sellerName, price);
+                    transferSuccess = true;
+                } catch (Exception creditEx) {
+                    CurrencyMod.LOGGER.error("Failed to credit seller {} with ${} from escrow: ",
+                        sellerName, price, creditEx);
+                    transferSuccess = false;
+                }
                 
                 if (transferSuccess) {
-                    CurrencyMod.LOGGER.info("Successfully transferred ${} from {} to {}", 
-                        price, buyerName, sellerName);
+                    CurrencyMod.LOGGER.info("Successfully credited ${} to seller {} from buyer {} escrow", 
+                        price, sellerName, buyerName);
                     
                     // Give the item to the buyer
                     ServerPlayerEntity buyer = server.getPlayerManager().getPlayer(buyerUuid);
