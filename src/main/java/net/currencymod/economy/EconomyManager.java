@@ -10,10 +10,11 @@ import java.io.FileReader;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.lang.reflect.Type;
-import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
 import java.util.Collections;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class EconomyManager {
     private static final Gson GSON = new GsonBuilder()
@@ -24,7 +25,18 @@ public class EconomyManager {
     private static final String ECONOMY_FILE = "currency_mod/economy.json";
     private static final double DEFAULT_BALANCE = 100.0;
 
-    private Map<UUID, Double> playerBalances = new HashMap<>();
+    // C-01 fix: playerBalances is read and mutated from the main server thread
+    // AND from at least three scheduler threads (WebSyncManager's Timer,
+    // PlotManager's ScheduledExecutorService, TradeManager/AuctionManager
+    // expiry schedulers). Plain HashMap is unsafe under concurrent mutation:
+    // concurrent put/get can infinite-loop on table resize (defensive in
+    // modern JVMs but corruption still occurs), silently lose writes, or
+    // return stale nulls. ConcurrentHashMap's per-bin locking makes
+    // individual mutations atomic and iteration weakly-consistent (no CME).
+    //
+    // volatile so that loadData() can safely replace the entire map
+    // reference and all reader threads observe the new map promptly.
+    private volatile Map<UUID, Double> playerBalances = new ConcurrentHashMap<>();
     
     /**
      * Get a player's balance
@@ -32,12 +44,12 @@ public class EconomyManager {
      * @return The player's balance
      */
     public double getBalance(UUID playerUuid) {
-        // If player doesn't exist in the map, add them with the default balance
-        if (!playerBalances.containsKey(playerUuid)) {
-            playerBalances.put(playerUuid, DEFAULT_BALANCE);
-            CurrencyMod.LOGGER.debug("Added player {} to economy with default balance", playerUuid);
-        }
-        return playerBalances.get(playerUuid);
+        // computeIfAbsent is atomic per-key in ConcurrentHashMap: two threads
+        // racing on a new UUID will only insert the default once.
+        return playerBalances.computeIfAbsent(playerUuid, k -> {
+            CurrencyMod.LOGGER.debug("Added player {} to economy with default balance", k);
+            return DEFAULT_BALANCE;
+        });
     }
     
     /**
@@ -52,14 +64,26 @@ public class EconomyManager {
     /**
      * Add money to a player's balance
      * @param playerUuid The UUID of the player
-     * @param amount The amount to add
+     * @param amount The amount to add (may be negative for a refund reversal)
      * @return The new balance
      */
     public double addBalance(UUID playerUuid, double amount) {
-        double currentBalance = getBalance(playerUuid);
-        double newBalance = currentBalance + amount;
-        setBalance(playerUuid, newBalance);
-        return newBalance;
+        // C-01 fix: atomic read-modify-write via compute. The old code did
+        // getBalance + setBalance as two separate calls, which raced with
+        // concurrent addBalance/removeBalance on the same UUID: both threads
+        // could read the same old value and the second write would silently
+        // overwrite the first. compute holds the per-bin lock for the entire
+        // function, so concurrent mutations on the same key serialize.
+        // Negative amounts (used by C-09 sell-path refund) are allowed --
+        // they reduce the balance, which is the intent.
+        AtomicReference<Double> resultRef = new AtomicReference<>();
+        playerBalances.compute(playerUuid, (k, v) -> {
+            double current = (v == null) ? DEFAULT_BALANCE : v;
+            double newBalance = current + amount;
+            resultRef.set(newBalance);
+            return newBalance;
+        });
+        return resultRef.get();
     }
     
     /**
@@ -69,14 +93,25 @@ public class EconomyManager {
      * @return The new balance, or -1 if the player doesn't have enough money
      */
     public double removeBalance(UUID playerUuid, double amount) {
-        double currentBalance = getBalance(playerUuid);
-        if (currentBalance < amount) {
-            return -1; // Not enough money
-        }
-        
-        double newBalance = currentBalance - amount;
-        setBalance(playerUuid, newBalance);
-        return newBalance;
+        // C-01 fix: atomic check-and-decrement via compute. The old code did
+        // getBalance (check) + setBalance (decrement) as two separate calls,
+        // which raced with concurrent removeBalance on the same UUID: two
+        // threads could both see sufficient funds and both succeed, driving
+        // the balance negative. This compose directly with the C-05 and C-09
+        // return-value checks -- those checks are only meaningful because
+        // this method's check-and-decrement is now atomic per-key.
+        AtomicReference<Double> resultRef = new AtomicReference<>();
+        playerBalances.compute(playerUuid, (k, v) -> {
+            double current = (v == null) ? DEFAULT_BALANCE : v;
+            if (current < amount) {
+                resultRef.set(-1.0);
+                return current; // no change
+            }
+            double newBalance = current - amount;
+            resultRef.set(newBalance);
+            return newBalance;
+        });
+        return resultRef.get();
     }
     
     /**
@@ -90,18 +125,43 @@ public class EconomyManager {
         if (amount <= 0) {
             return false;
         }
-        
-        double senderBalance = getBalance(fromUuid);
-        if (senderBalance < amount) {
-            return false; // Sender doesn't have enough money
+        // Self-transfer is a no-op success (the check below would otherwise
+        // deduct then re-add the same amount, which is wasteful but harmless;
+        // short-circuiting is clearer).
+        if (fromUuid.equals(toUuid)) {
+            // Still ensure the player has enough funds for accounting parity.
+            return getBalance(fromUuid) >= amount;
         }
         
-        // Remove from sender
-        setBalance(fromUuid, senderBalance - amount);
+        // C-01 fix: each leg is an atomic per-key compute. The sender leg
+        // does the check-and-decrement atomically (only deducts if funds are
+        // sufficient); the receiver leg is a pure atomic credit. The two
+        // legs are NOT atomic with respect to each other -- a crash between
+        // them leaves the sender debited but the receiver not credited --
+        // but that is a pre-existing persistence concern (the economy.json
+        // save is periodic, not per-transaction) and is out of scope for
+        // C-01, which is specifically about the in-memory concurrency bug.
+        AtomicReference<Boolean> successRef = new AtomicReference<>(Boolean.FALSE);
+        playerBalances.compute(fromUuid, (k, v) -> {
+            double current = (v == null) ? DEFAULT_BALANCE : v;
+            if (current < amount) {
+                return current; // no change, successRef stays FALSE
+            }
+            successRef.set(Boolean.TRUE);
+            return current - amount;
+        });
+        if (!successRef.get()) {
+            return false;
+        }
         
-        // Add to receiver
-        double receiverBalance = getBalance(toUuid);
-        setBalance(toUuid, receiverBalance + amount);
+        // Atomic credit to receiver. merge() handles the absent-key case
+        // by inserting 'amount' directly; for an existing key it applies
+        // the remapping function. We still need the DEFAULT_BALANCE base
+        // for new receivers, so use compute instead of merge.
+        playerBalances.compute(toUuid, (k, v) -> {
+            double current = (v == null) ? DEFAULT_BALANCE : v;
+            return current + amount;
+        });
         
         return true;
     }
@@ -129,7 +189,7 @@ public class EconomyManager {
         // Check if the file is accessible
         if (!economyFile.exists()) {
             CurrencyMod.LOGGER.info("No economy data file found, starting with fresh data");
-            playerBalances = new HashMap<>();
+            playerBalances = new ConcurrentHashMap<>();
             return;
         }
         
@@ -143,30 +203,38 @@ public class EconomyManager {
             String jsonContent = FileUtil.safeReadFromFile(economyFile);
             if (jsonContent == null || jsonContent.isEmpty()) {
                 CurrencyMod.LOGGER.warn("Empty economy file, starting with fresh data");
-                playerBalances = new HashMap<>();
+                playerBalances = new ConcurrentHashMap<>();
                 return;
             }
             
             // Parse the JSON
             JsonObject rootObject = JsonParser.parseString(jsonContent).getAsJsonObject();
-            playerBalances.clear();
+            // C-01 fix: build the new map locally, then assign it atomically.
+            // The old code did playerBalances.clear() followed by per-entry
+            // put() calls, which left a window where reader threads on other
+            // cores could see an empty or partially-loaded map. By building
+            // a fresh ConcurrentHashMap and assigning the field reference at
+            // the end (volatile write), readers either see the old complete
+            // map or the new complete map -- never a half-loaded one.
+            Map<UUID, Double> loaded = new ConcurrentHashMap<>();
             
             // Deserialize the player balances
             for (Map.Entry<String, JsonElement> entry : rootObject.entrySet()) {
                 try {
                     UUID playerUuid = UUID.fromString(entry.getKey());
                     double balance = entry.getValue().getAsDouble();
-                    playerBalances.put(playerUuid, balance);
+                    loaded.put(playerUuid, balance);
                 } catch (Exception e) {
                     CurrencyMod.LOGGER.error("Error parsing player entry: " + entry.getKey(), e);
                 }
             }
             
+            playerBalances = loaded;
             CurrencyMod.LOGGER.info("Loaded economy data for {} players", playerBalances.size());
         } catch (Exception e) {
             CurrencyMod.LOGGER.error("Failed to load economy data", e);
             // Reset to empty map in case of error
-            playerBalances = new HashMap<>();
+            playerBalances = new ConcurrentHashMap<>();
         }
     }
     
