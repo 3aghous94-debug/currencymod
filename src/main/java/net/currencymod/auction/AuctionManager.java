@@ -1064,7 +1064,33 @@ public class AuctionManager {
         auctionProcessed = true;
         
         CurrencyMod.LOGGER.info("Auction cancelled by player: {} (auctionProcessed flag set to true)", playerUuid);
-        
+
+        // Refund the current highest bidder (C-06 fix).
+        // Bidder's balance was escrowed (deducted) at placeBid time (line 923).
+        // Without this refund, a malicious seller could list a junk item, wait
+        // for a victim to bid, then /auction cancel to permanently destroy the
+        // bidder's escrowed money while keeping the item.
+        // v3.0 regression notes:
+        //  - Guard against null currentBid (no-bidder case).
+        //  - Use UUID-keyed addBalance so offline bidders still get their refund.
+        //  - Self-bid is already rejected at placeBid (line 847), but the guard
+        //    here is still safe if that invariant ever changes.
+        Bid currentHighestBid = currentAuction.getCurrentBid();
+        if (currentHighestBid != null) {
+            UUID bidderUuid = currentHighestBid.getBidderUuid();
+            double refundAmount = currentHighestBid.getBidAmount();
+            economyManager.addBalance(bidderUuid, refundAmount);
+            CurrencyMod.LOGGER.info("Refunded ${} to bidder {} after auction cancellation by seller {}",
+                refundAmount, bidderUuid, playerUuid);
+
+            // Notify the bidder if they're online (same pattern as placeBid refund at line 915-919).
+            ServerPlayerEntity bidder = server.getPlayerManager().getPlayer(bidderUuid);
+            if (bidder != null) {
+                bidder.sendMessage(Text.literal("§6[Auction] §cThe auction you bid on was canceled by the seller. " +
+                    "§eYour bid of §a" + refundAmount + " §ehas been refunded."));
+            }
+        }
+
         // Return the item to the seller if they're online
         ServerPlayerEntity seller = server.getPlayerManager().getPlayer(playerUuid);
         if (seller != null) {
