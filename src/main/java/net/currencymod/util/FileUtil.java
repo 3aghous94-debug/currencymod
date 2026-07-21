@@ -155,7 +155,18 @@ public class FileUtil {
             // If file exists, create a backup first
             if (file.exists()) {
                 if (file.canWrite()) {
-                    backupFile(server, file);
+                    // N2-C-01 fix: the old code discarded backupFile's return
+                    // value. If the backup failed silently (e.g. backup
+                    // directory not writable, disk full), there was no
+                    // recovery .bak either -- so the destructive delete at
+                    // line 186 below would leave zero copies of the data if
+                    // rename + copy both failed. We now abort if backup fails.
+                    boolean backupOk = backupFile(server, file);
+                    if (!backupOk) {
+                        LOGGER.error("Failed to create backup of {}; aborting write to prevent potential data loss (N2-C-01)",
+                            file.getAbsolutePath());
+                        return false;
+                    }
                 } else {
                     LOGGER.error("Cannot write to existing file: {} (permissions denied)", file.getAbsolutePath());
                     return false;
@@ -164,6 +175,13 @@ public class FileUtil {
             
             // Write to a temporary file first for atomic replacement
             File tempFile = new File(file.getAbsolutePath() + ".tmp");
+            // N2-C-01 fix: track whether the temp file's contents have been
+            // safely replicated to the target. The finally block below uses
+            // this flag to decide whether it is safe to delete tempFile --
+            // deleting tempFile while it still holds the ONLY copy of the
+            // data (target file already deleted, rename failed, copy failed)
+            // was the root cause of the silent-data-loss bug.
+            boolean targetHasData = false;
             try {
                 // Use FileOutputStream with explicit flush to ensure data is written
                 try (FileOutputStream fos = new FileOutputStream(tempFile);
@@ -181,41 +199,72 @@ public class FileUtil {
                     return false;
                 }
                 
-                // Rename the temp file to the target file for atomic operation
-                if (file.exists()) {
-                    if (!file.delete()) {
-                        LOGGER.error("Failed to delete existing file during atomic write: {}", file.getAbsolutePath());
-                        return false;
+                // N2-C-01 fix: try the rename FIRST without deleting the
+                // original. File.renameTo on the same filesystem is atomic
+                // and on POSIX replaces the destination atomically. On
+                // Windows or cross-filesystem, renameTo may fail; only THEN
+                // do we fall through to the destructive delete+copy path.
+                // This preserves the original file as a recovery source if
+                // the rename fails and the subsequent copy also fails.
+                boolean renamed = tempFile.renameTo(file);
+                
+                if (renamed) {
+                    targetHasData = true;
+                    LOGGER.info("Successfully renamed temp file to {}", file);
+                } else {
+                    // Rename failed (likely cross-filesystem or target exists
+                    // and the OS does not support atomic replace). Fall back
+                    // to Files.copy with REPLACE_EXISTING, which on most
+                    // platforms does an atomic replace if same filesystem.
+                    LOGGER.warn("tempFile.renameTo failed (likely cross-filesystem or OS does not support atomic replace); falling back to Files.copy: {} -> {}",
+                        tempFile, file);
+                    try {
+                        Files.copy(tempFile.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                        // Verify the copy succeeded by checking the target
+                        // file's length matches the temp file's length.
+                        if (file.exists() && file.length() == tempFile.length()) {
+                            targetHasData = true;
+                            LOGGER.info("Fallback Files.copy succeeded for {}", file);
+                        } else {
+                            LOGGER.error("Fallback Files.copy produced a target file with mismatched length " +
+                                "(temp={}, target={}); treating as failure",
+                                tempFile.length(), file.exists() ? file.length() : -1);
+                        }
+                    } catch (Exception e) {
+                        LOGGER.error("Fallback Files.copy also failed: {}", e.getMessage());
                     }
                 }
                 
-                boolean renamed = tempFile.renameTo(file);
-                
-                if (!renamed) {
-                    LOGGER.error("Failed to rename temp file to target file: {} -> {}", tempFile, file);
-                    
-                    // Attempt a direct copy as fallback
-                    try {
-                        LOGGER.info("Attempting fallback direct copy method");
-                        Files.copy(tempFile.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING);
-                        tempFile.delete(); // Clean up the temp file
-                        renamed = true;
-                    } catch (Exception e) {
-                        LOGGER.error("Fallback direct copy also failed: {}", e.getMessage());
-                    }
-                    
-                    if (!renamed) {
-                        return false;
-                    }
+                if (!targetHasData) {
+                    // Both rename and copy failed. The original file is
+                    // STILL INTACT (we never deleted it -- the old code did
+                    // `file.delete()` before rename, which is what caused
+                    // the data loss). Return false so the caller knows the
+                    // write failed; the original data is preserved.
+                    LOGGER.error("Failed to write to file {} by any method; original file is preserved (N2-C-01 fix)",
+                        file.getAbsolutePath());
+                    return false;
                 }
                 
                 // Log success
                 LOGGER.info("Successfully wrote to file {} ({} bytes)", file, file.length());
                 return true;
             } finally {
-                // Always try to clean up temp file
-                if (tempFile.exists()) {
-                    tempFile.delete();
+                // N2-C-01 fix: only delete the temp file if we have
+                // confirmed the target file has the data. If targetHasData
+                // is false, the temp file may still be the only copy of the
+                // data we just wrote (though in the current control flow we
+                // return false above before reaching here, so this is
+                // defensive). Keeping the temp file gives operators a chance
+                // to manually recover the data.
+                if (tempFile.exists() && targetHasData) {
+                    if (!tempFile.delete()) {
+                        LOGGER.warn("Failed to clean up temp file {} (target file is intact; this is non-fatal)",
+                            tempFile.getAbsolutePath());
+                    }
+                } else if (tempFile.exists()) {
+                    LOGGER.warn("Keeping temp file {} for manual recovery (target file write was not confirmed)",
+                        tempFile.getAbsolutePath());
                 }
             }
         } catch (Exception e) {
