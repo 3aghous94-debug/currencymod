@@ -27,10 +27,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import net.minecraft.registry.entry.RegistryEntry;
 
 /**
@@ -47,7 +49,18 @@ public class TradeManager {
     private static final int[] REMINDER_INTERVALS = {30, 15, 5};
     
     // Map of active trade requests: target player UUID -> trade request
-    private final Map<UUID, TradeRequest> activeTradeRequests = new HashMap<>();
+    //
+    // C-02 fix: was a plain HashMap, mutated from BOTH the main server thread
+    // (acceptTradeRequest, denyTradeRequest, createTradeRequest) AND the
+    // scheduler thread (expireTradeRequest via scheduler.schedule). The old
+    // accept/expire paths did containsKey + get + side-effect + remove as
+    // four separate calls, so concurrent accept + expire could both pass the
+    // containsKey check and both execute their side-effects -- the seller
+    // would get the item back via expire AND the buyer would also receive the
+    // item via accept, duplicating it. ConcurrentHashMap.compute makes the
+    // check-and-remove atomic: whichever thread calls compute first wins, the
+    // other sees null inside the lambda and aborts cleanly.
+    private final Map<UUID, TradeRequest> activeTradeRequests = new ConcurrentHashMap<>();
     
     // Scheduler for trade timeouts
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
@@ -172,25 +185,43 @@ public class TradeManager {
     public boolean acceptTradeRequest(ServerPlayerEntity targetPlayer) {
         UUID targetUuid = targetPlayer.getUuid();
         
-        // Check if there's an active trade request for this player
-        if (!activeTradeRequests.containsKey(targetUuid)) {
-            return false;
+        // C-02 fix: atomic check-and-remove via ConcurrentHashMap.compute.
+        // The old code did containsKey + get + cancel + executeTradeTransaction
+        // + remove as separate calls. If expireTradeRequest ran concurrently on
+        // the scheduler thread, both paths could pass the containsKey check and
+        // both execute their side-effects (expire returns the item to sender,
+        // accept gives the item to the buyer) -- duplicating the item.
+        //
+        // compute holds the per-bin lock for the entire lambda, so concurrent
+        // accept vs expire on the same UUID serialize. Whichever wins sets the
+        // AtomicReference; the loser sees a null value inside the lambda and
+        // returns null without side-effects.
+        AtomicReference<TradeRequest> claimedRef = new AtomicReference<>(null);
+        activeTradeRequests.compute(targetUuid, (k, req) -> {
+            if (req == null) {
+                return null; // no active request; nothing to claim
+            }
+            // Cancel the timeout future inside the lock so expire cannot
+            // start executing while we hold this bin. cancel(false) is
+            // best-effort -- if expire is already mid-execution it will
+            // also try to compute() on this key, see null, and abort.
+            if (req.getTimeoutFuture() != null) {
+                req.getTimeoutFuture().cancel(false);
+            }
+            claimedRef.set(req);
+            return null; // remove from map (we claimed it)
+        });
+        
+        TradeRequest request = claimedRef.get();
+        if (request == null) {
+            return false; // already expired, denied, or never existed
         }
         
-        TradeRequest request = activeTradeRequests.get(targetUuid);
-        
-        // Cancel the timeout future
-        if (request.getTimeoutFuture() != null) {
-            request.getTimeoutFuture().cancel(false);
-        }
-        
-        // Execute the trade
-        boolean success = executeTradeTransaction(request);
-        
-        // Remove the trade request
-        activeTradeRequests.remove(targetUuid);
-        
-        return success;
+        // Now execute the trade OUTSIDE the map lock. The request is no
+        // longer in the map, so a concurrent expire/deny will see null and
+        // abort. The item is only in this TradeRequest object, so only one
+        // of {accept, expire, deny} can act on it.
+        return executeTradeTransaction(request);
     }
     
     /**
@@ -201,16 +232,23 @@ public class TradeManager {
     public boolean denyTradeRequest(ServerPlayerEntity targetPlayer) {
         UUID targetUuid = targetPlayer.getUuid();
         
-        // Check if there's an active trade request for this player
-        if (!activeTradeRequests.containsKey(targetUuid)) {
+        // C-02 fix: same atomic claim pattern as acceptTradeRequest. Prevents
+        // a concurrent expire/accept from also acting on the same request.
+        AtomicReference<TradeRequest> claimedRef = new AtomicReference<>(null);
+        activeTradeRequests.compute(targetUuid, (k, req) -> {
+            if (req == null) {
+                return null;
+            }
+            if (req.getTimeoutFuture() != null) {
+                req.getTimeoutFuture().cancel(false);
+            }
+            claimedRef.set(req);
+            return null; // remove from map (we claimed it)
+        });
+        
+        TradeRequest request = claimedRef.get();
+        if (request == null) {
             return false;
-        }
-        
-        TradeRequest request = activeTradeRequests.get(targetUuid);
-        
-        // Cancel the timeout future
-        if (request.getTimeoutFuture() != null) {
-            request.getTimeoutFuture().cancel(false);
         }
         
         // Return the item to the sender's inventory
@@ -233,9 +271,6 @@ public class TradeManager {
             
         targetPlayer.sendMessage(message);
         
-        // Remove the trade request
-        activeTradeRequests.remove(targetUuid);
-        
         LOGGER.info("Trade request from {} to {} was denied", 
             request.getSender().getName().getString(), 
             targetPlayer.getName().getString());
@@ -249,8 +284,35 @@ public class TradeManager {
     private void expireTradeRequest(TradeRequest request) {
         ServerPlayerEntity target = request.getTarget();
         
-        // Check if the request is still active
-        if (target == null || !activeTradeRequests.containsKey(target.getUuid())) {
+        // C-02 fix: atomic check-and-remove via ConcurrentHashMap.compute.
+        // The old code did containsKey + returnItemToSender + remove as
+        // separate calls. If acceptTradeRequest ran concurrently on the
+        // server thread, both paths could pass the containsKey check and
+        // both execute their side-effects (expire returns the item to sender,
+        // accept gives the item to the buyer) -- duplicating the item.
+        //
+        // compute holds the per-bin lock for the entire lambda, so concurrent
+        // accept vs expire on the same UUID serialize. Whichever wins sets the
+        // AtomicReference; the loser sees a different value (null if the other
+        // already removed it, or a different request if it was replaced) and
+        // aborts.
+        if (target == null) {
+            return;
+        }
+        AtomicReference<TradeRequest> claimedRef = new AtomicReference<>(null);
+        activeTradeRequests.compute(target.getUuid(), (k, req) -> {
+            // Only claim if the map still holds OUR request. If accept/deny
+            // already removed it, or if it was replaced with a newer request,
+            // abort -- do NOT return the item to the sender.
+            if (req == null || req != request) {
+                return req; // leave the map unchanged
+            }
+            claimedRef.set(req);
+            return null; // remove from map (we claimed it)
+        });
+        
+        if (claimedRef.get() == null) {
+            // Request was already accepted, denied, or replaced. Do nothing.
             return;
         }
         
@@ -276,9 +338,6 @@ public class TradeManager {
                 
             target.sendMessage(message);
         }
-        
-        // Remove the trade request
-        activeTradeRequests.remove(target.getUuid());
         
         LOGGER.info("Trade request from {} to {} expired", 
             sender != null ? sender.getName().getString() : "unknown", 
