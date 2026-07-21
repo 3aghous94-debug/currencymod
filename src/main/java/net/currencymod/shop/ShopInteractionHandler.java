@@ -503,9 +503,45 @@ public class ShopInteractionHandler {
                 }
             }
             
-            // Process transaction
-            // 1. Remove money from player
-            economyManager.removeBalance(player.getUuid(), price);
+            // C-09 fix (buy path): make the transaction atomic across
+            // economy + chest + player inventory.
+            //
+            // The pre-checks above (line 476 balance, line 491 stock) are
+            // TOCTOU: a concurrent tax/service-charge deduction can drop the
+            // player's balance below 'price' between the check and the actual
+            // removeBalance call. The old code discarded removeBalance's
+            // return value, so a failed deduction silently let the player take
+            // the items for free. We now check the return value and abort
+            // cleanly if the deduction fails.
+            //
+            // We also pre-check hasInventorySpace BEFORE deducting money, so
+            // the player is never charged for items we cannot deliver. The
+            // addItemsToPlayer helper has also been hardened to drop any
+            // leftover at the player's feet if the inventory fills up mid-
+            // insertion (defensive: even with the pre-check, a concurrent
+            // inventory change could still leave a partial leftover).
+            if (!hasInventorySpace(player, itemDetails.item, itemDetails.quantity)) {
+                Text errorText = Text.literal("❌ ").formatted(Formatting.RED)
+                    .append(Text.literal("Inventory Full").formatted(Formatting.RED, Formatting.BOLD));
+                Text detailsText = Text.literal("Make space in your inventory before buying.");
+                player.sendMessage(errorText, false);
+                player.sendMessage(detailsText, false);
+                return;
+            }
+
+            // 1. Remove money from player -- check return value (C-09 fix).
+            double deductResult = economyManager.removeBalance(player.getUuid(), price);
+            if (deductResult < 0) {
+                LOGGER.warn("Buy transaction aborted for player {}: balance dropped below price {} " +
+                    "between pre-check and removeBalance (likely concurrent tax/service charge)",
+                    player.getName().getString(), price);
+                Text errorText = Text.literal("❌ ").formatted(Formatting.RED)
+                    .append(Text.literal("Insufficient Funds").formatted(Formatting.RED, Formatting.BOLD));
+                Text detailsText = Text.literal("Your balance changed during the transaction. Please try again.");
+                player.sendMessage(errorText, false);
+                player.sendMessage(detailsText, false);
+                return; // no money moved, no items moved, no chest mutation
+            }
             
             if (!isAdminShop) {
                 // 2. Add money to shop owner (skip for admin shops)
@@ -514,7 +550,9 @@ public class ShopInteractionHandler {
                 removeItemsFromChest(chest, itemDetails.item, itemDetails.quantity, prototypeItem);
             }
             
-            // 4. Add items to player (using prototype for enchantments)
+            // 4. Add items to player (using prototype for enchantments).
+            //    Helper now drops any leftover at the player's feet if the
+            //    inventory fills up mid-insertion (C-09 fix).
             addItemsToPlayer(player, prototypeItem, itemDetails.quantity);
             
             // Send a single-line transaction message
@@ -610,13 +648,41 @@ public class ShopInteractionHandler {
                 return;
             }
             
-            // Process transaction
-            // 1. Add money to player
+            // C-09 fix (sell path): symmetric guard against the buy path.
+            //
+            // We credit the player first via addBalance (cannot fail -- it
+            // just sets a map value), then attempt to deduct from the shop
+            // owner. If the owner's balance dropped below 'price' between the
+            // pre-check (line 587) and now (e.g. owner is online and spending),
+            // removeBalance returns -1. We must then REFUND the player (undo
+            // the addBalance) and abort, otherwise the player gets paid for
+            // free and the shop owner keeps the items.
+            //
+            // We do NOT remove items from the player or add items to the chest
+            // until the owner-side deduction succeeds. This keeps the sell
+            // path atomic: either all three legs succeed, or none of them do.
+            //
+            // 1. Add money to player (cannot fail)
             economyManager.addBalance(player.getUuid(), price);
             
             if (!isAdminShop) {
-                // 2. Remove money from shop owner (skip for admin shops)
-                economyManager.removeBalance(shopData.getOwner(), price);
+                // 2. Remove money from shop owner -- check return value (C-09 fix).
+                double ownerDeduct = economyManager.removeBalance(shopData.getOwner(), price);
+                if (ownerDeduct < 0) {
+                    // Owner can no longer afford the purchase. Refund the player,
+                    // do NOT touch items or chest, abort the transaction.
+                    economyManager.addBalance(player.getUuid(), -price); // undo the credit
+                    LOGGER.warn("Sell transaction aborted for player {}: shop owner {} balance dropped " +
+                        "below price {} between pre-check and removeBalance; player refunded",
+                        player.getName().getString(), shopData.getOwner(), price);
+                    Text errorText = Text.literal("❌ ").formatted(Formatting.RED)
+                        .append(Text.literal("Shop Can't Afford Purchase").formatted(Formatting.RED, Formatting.BOLD));
+                    Text detailsText = Text.literal("The shop owner's balance changed during the transaction. " +
+                        "Your items were not taken; please try again.");
+                    player.sendMessage(errorText, false);
+                    player.sendMessage(detailsText, false);
+                    return;
+                }
                 // 3. Add items to chest (skip for admin shops)
                 addItemsToChest(chest, itemDetails.item, itemDetails.quantity, prototypeItem);
             }
@@ -963,8 +1029,23 @@ public class ShopInteractionHandler {
         ItemStack itemToAdd = prototype.copy();
         itemToAdd.setCount(quantity);
         
-        // Insert the item into the player's inventory
-        player.getInventory().insertStack(itemToAdd);
+        // Insert the item into the player's inventory. insertStack mutates
+        // itemToAdd in place: any leftover that did not fit remains in the
+        // stack and the method returns false. The old code discarded the
+        // leftover, silently destroying items the player had paid for (C-09).
+        // We now drop any leftover at the player's feet, matching the pattern
+        // in AuctionManager.giveItemToPlayer (line ~1208) and TradeManager
+        // (line ~297).
+        boolean fullyInserted = player.getInventory().insertStack(itemToAdd);
+        if (!fullyInserted || !itemToAdd.isEmpty()) {
+            LOGGER.warn("Player {} inventory was full during shop purchase; dropping {}x {} at their feet",
+                player.getName().getString(), itemToAdd.getCount(), prototype.getItem().getName().getString());
+            player.dropItem(itemToAdd, false);
+            player.sendMessage(Text.literal("Your inventory was full, so " +
+                itemToAdd.getCount() + "x " +
+                prototype.getName().getString() +
+                " was dropped at your feet.").formatted(Formatting.YELLOW), false);
+        }
     }
     
     /**
