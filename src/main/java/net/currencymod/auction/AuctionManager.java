@@ -1644,7 +1644,17 @@ public class AuctionManager {
                 if (itemStack != null && !itemStack.isEmpty()) {
                     // Use a more detailed approach - store item type, count and display name
                     JsonObject itemObject = new JsonObject();
-                    itemObject.addProperty("itemId", itemStack.getItem().toString());
+                    // C-07 fix: the old code used itemStack.getItem().toString(),
+                    // which is NOT a valid Identifier (it returns either the
+                    // Item class's toString override -- typically a translated
+                    // display name like "Diamond" -- or the default
+                    // Object.toString() like "net.minecraft.item.Item@hashcode").
+                    // Either way, the load side could never parse it back into
+                    // the correct Item, which is why the load-side fell back to
+                    // diamonds for every entry. Use Registries.ITEM.getId(...)
+                    // instead, which returns a proper Identifier like
+                    // "minecraft:diamond".
+                    itemObject.addProperty("itemId", Registries.ITEM.getId(itemStack.getItem()).toString());
                     itemObject.addProperty("count", itemStack.getCount());
                     itemObject.addProperty("displayName", itemStack.getName().getString());
                     
@@ -1667,6 +1677,64 @@ public class AuctionManager {
         } catch (Exception e) {
             CurrencyMod.LOGGER.error("Failed to save pending auction items", e);
         }
+    }
+    
+    /**
+     * C-07 migration helper: recover an ItemStack from a displayName string
+     * when the saved itemId field is missing or invalid (e.g. files saved
+     * with the buggy getItem().toString() format). Per the audit's v3.0
+     * verification notes:
+     *   1. Iterate Registries.ITEM.stream() and match by item.getName()
+     *      .getString() (works for vanilla items only).
+     *   2. Try Registries.ITEM.get(Identifier.of("minecraft:" + displayName
+     *      .toLowerCase())) as a heuristic.
+     *   3. If still no match, return ItemStack.EMPTY -- do NOT substitute
+     *      diamonds. The caller logs the displayName + playerUuid for
+     *      manual recovery.
+     *
+     * @param displayName The display name to match against (e.g. "Diamond")
+     * @param count The stack count to apply to the recovered item
+     * @return The recovered ItemStack, or ItemStack.EMPTY if no match
+     */
+    private ItemStack recoverItemByDisplayName(String displayName, int count) {
+        if (displayName == null || displayName.isEmpty() || "Unknown Item".equals(displayName)) {
+            return ItemStack.EMPTY;
+        }
+        
+        // Strategy 1: iterate the item registry and match by display name.
+        // Works for vanilla items; custom modded items registered after this
+        // build will also be found if their getName() matches.
+        try {
+            for (Item item : Registries.ITEM.stream().toList()) {
+                try {
+                    if (displayName.equals(item.getName().getString())) {
+                        return new ItemStack(item, count);
+                    }
+                } catch (Exception ignored) {
+                    // Some items may throw on getName() in edge cases; skip them.
+                }
+            }
+        } catch (Exception e) {
+            CurrencyMod.LOGGER.warn("C-07 migration: error iterating item registry for displayName recovery: {}", e.getMessage());
+        }
+        
+        // Strategy 2: heuristic -- try "minecraft:" + displayName.toLowerCase()
+        // as an Identifier. Handles common cases like "Diamond" -> minecraft:diamond.
+        try {
+            Identifier heuristic = Identifier.of("minecraft:" + displayName.toLowerCase().replace(' ', '_'));
+            Item resolved = Registries.ITEM.get(heuristic);
+            if (resolved != null && resolved != Items.AIR) {
+                CurrencyMod.LOGGER.info("C-07 migration: heuristic recovery succeeded for displayName='{}' -> {}",
+                    displayName, heuristic);
+                return new ItemStack(resolved, count);
+            }
+        } catch (Exception ignored) {
+            // Identifier.of may throw on invalid characters; fall through to EMPTY.
+        }
+        
+        // Strategy 3: no match. Return EMPTY (caller will log + skip).
+        CurrencyMod.LOGGER.warn("C-07 migration: could not recover item for displayName='{}'; returning EMPTY", displayName);
+        return ItemStack.EMPTY;
     }
     
     /**
@@ -1698,30 +1766,79 @@ public class AuctionManager {
                 try {
                     UUID playerUuid = UUID.fromString(entry.getKey());
                     
-                    // Default to a diamond with 64 count to ensure the player gets something valuable
-                    ItemStack itemStack = new ItemStack(Items.DIAMOND, 64);
+                    // C-07 fix: the old code defaulted to
+                    // `new ItemStack(Items.DIAMOND, 64)` for EVERY entry and
+                    // never read the itemId field. A player with a pending
+                    // return of 1 dirt block would instead receive 64 diamonds.
+                    // We now resolve the item via Registries.ITEM.get(
+                    // Identifier.of(itemId)) and fall back to ItemStack.EMPTY
+                    // (NOT diamond, NOT air) if the item cannot be resolved.
+                    // ItemStack.EMPTY is skipped on delivery (giveItemToPlayer
+                    // checks isEmpty()), so the player simply doesn't receive
+                    // an item rather than receiving the wrong one.
+                    ItemStack itemStack = ItemStack.EMPTY;
+                    String displayName = "Unknown Item";
+                    int count = 1;
                     
-                    // If the element is an object with item info, try to recreate it
                     if (entry.getValue().isJsonObject()) {
                         JsonObject itemObject = entry.getValue().getAsJsonObject();
-                        int count = 1;
                         
                         if (itemObject.has("count")) {
                             count = itemObject.get("count").getAsInt();
                         }
                         
-                        // Use the diamond as fallback, but try to get the right item
-                        itemStack = new ItemStack(Items.DIAMOND, count);
+                        if (itemObject.has("displayName")) {
+                            displayName = itemObject.get("displayName").getAsString();
+                        }
                         
-                        // Log what we're loading
-                        String displayName = itemObject.has("displayName") ? 
-                            itemObject.get("displayName").getAsString() : "Unknown Item";
+                        if (itemObject.has("itemId")) {
+                            String itemIdStr = itemObject.get("itemId").getAsString();
+                            // Try direct Identifier parse (handles new format
+                            // "minecraft:diamond" and bare names that
+                            // Identifier.of will normalize).
+                            try {
+                                Identifier itemId = Identifier.of(itemIdStr);
+                                Item resolved = Registries.ITEM.get(itemId);
+                                if (resolved != null && resolved != Items.AIR) {
+                                    itemStack = new ItemStack(resolved, count);
+                                } else {
+                                    CurrencyMod.LOGGER.warn(
+                                        "C-07 migration: itemId '{}' resolved to null/air for player {} (displayName={}); skipping entry",
+                                        itemIdStr, playerUuid, displayName);
+                                }
+                            } catch (Exception idEx) {
+                                // itemId is not a valid Identifier -- likely
+                                // an old-format file saved with the buggy
+                                // getItem().toString(). Try migration heuristics.
+                                CurrencyMod.LOGGER.warn(
+                                    "C-07 migration: invalid itemId '{}' for player {} (displayName={}); attempting displayName-based recovery",
+                                    itemIdStr, playerUuid, displayName);
+                                itemStack = recoverItemByDisplayName(displayName, count);
+                            }
+                        } else {
+                            // No itemId field at all (very old format). Try
+                            // displayName-based recovery.
+                            CurrencyMod.LOGGER.warn(
+                                "C-07 migration: no itemId field for player {} (displayName={}); attempting displayName-based recovery",
+                                playerUuid, displayName);
+                            itemStack = recoverItemByDisplayName(displayName, count);
+                        }
                         
-                        CurrencyMod.LOGGER.info("Loading item for player {}: {} x{}", 
-                            playerUuid, displayName, count);
+                        CurrencyMod.LOGGER.info("Loaded item for player {}: {} x{} (resolved={})",
+                            playerUuid, displayName, count,
+                            itemStack.isEmpty() ? "EMPTY" : Registries.ITEM.getId(itemStack.getItem()));
                     }
                     
-                    pendingItemReturns.put(playerUuid, itemStack);
+                    // Only insert if we successfully resolved an item. Empty
+                    // stacks are skipped -- the player gets nothing rather
+                    // than the wrong item.
+                    if (!itemStack.isEmpty()) {
+                        pendingItemReturns.put(playerUuid, itemStack);
+                    } else {
+                        CurrencyMod.LOGGER.warn(
+                            "C-07: skipping pending item return for player {} -- item could not be resolved (displayName={})",
+                            playerUuid, displayName);
+                    }
                     
                 } catch (Exception e) {
                     CurrencyMod.LOGGER.error("Failed to load pending item for player " + entry.getKey(), e);
