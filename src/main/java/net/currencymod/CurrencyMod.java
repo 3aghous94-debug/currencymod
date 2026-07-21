@@ -132,6 +132,15 @@ public class CurrencyMod implements ModInitializer, ClientModInitializer, Dedica
             // Load pending auction items
             AuctionManager.getInstance().loadPendingItems(server);
             
+            // N2-C-02 fix: recover any orphaned auction from a mid-auction crash.
+            // MUST run AFTER economyManager.loadData (line above, ~119) so the
+            // bidder-escrow refund via addBalance writes to the loaded economy
+            // map, AND AFTER loadPendingItems so the seller's item-return is
+            // appended to the already-loaded pendingItemReturns map. The
+            // recovery refunds the bidder (if any) and queues the item for
+            // return to the seller; see AuctionManager.recoverOrphanedAuction.
+            AuctionManager.getInstance().recoverOrphanedAuction();
+            
             // Load offline payments data
             OfflinePaymentManager.getInstance().loadOfflinePayments(server);
             

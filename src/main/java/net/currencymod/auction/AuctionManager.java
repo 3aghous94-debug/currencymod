@@ -199,9 +199,26 @@ public class AuctionManager {
         this.economyManager = CurrencyMod.getEconomyManager();
         // Load any pending items when the server starts
         loadPendingItems(server);
-        // N2-C-02 fix: recover any orphaned auction from a mid-auction crash
-        // BEFORE the auction checker starts processing. This refunds the
-        // bidder (if any) and queues the item for return to the seller.
+        // N2-C-02 fix: orphaned-auction recovery is NOT called here. It must
+        // run AFTER economyManager.loadData() (called later in
+        // CurrencyMod.java's SERVER_STARTING handler, line ~119) so that the
+        // bidder-escrow refund via addBalance writes to the LOADED economy
+        // map rather than an empty map that loadData will overwrite. The
+        // recovery is triggered explicitly from CurrencyMod.java after both
+        // economyManager.loadData and AuctionManager.loadPendingItems have
+        // completed. See recoverOrphanedAuction() below.
+    }
+
+    /**
+     * N2-C-02 fix: public entry point for orphaned-auction recovery. Must be
+     * called from CurrencyMod.java's SERVER_STARTING handler AFTER
+     * economyManager.loadData(server) has populated the economy map AND AFTER
+     * AuctionManager.loadPendingItems(server) has populated pendingItemReturns.
+     * Calling it before economyManager.loadData would silently lose the
+     * bidder-escrow refund (addBalance writes to an empty map that loadData
+     * then replaces).
+     */
+    public void recoverOrphanedAuction() {
         loadCurrentAuctionAndRecoverOrphans();
     }
     
