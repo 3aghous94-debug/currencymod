@@ -84,6 +84,22 @@ public class AuctionManager {
     // Track if an auction has been processed to avoid duplicate endings
     private boolean auctionProcessed = false;
     
+    // C-03 fix: lock guarding currentAuction, auctionProcessed, and all
+    // state-mutating auction operations (createAuction, placeBid, cancelAuction,
+    // endAuction, extendAuctionTime). The scheduler thread (endAuctionTask,
+    // auctionCheckerTask) and the server thread (placeBid, cancelAuction,
+    // processBuyItNow) previously mutated this state without synchronization,
+    // causing races where endAuction and placeBid could both run concurrently
+    // -- refunding a bidder twice, charging a bidder whose bid was never
+    // registered, or delivering the item to the old winner while a new bid's
+    // money was also taken.
+    //
+    // The scheduler-side callbacks are also marshaled to the server thread
+    // via server.execute(...) so the lock is only ever acquired from one
+    // thread in practice; the synchronized block is belt-and-suspenders for
+    // any code path we missed.
+    private final Object auctionLock = new Object();
+    
     private EconomyManager economyManager;
     private long lastBidTime = 0;
     
@@ -123,36 +139,44 @@ public class AuctionManager {
             return;
         }
         
-        // Check if there's an active auction
-        if (currentAuction != null && !auctionProcessed) {
-            // Check if the auction should have ended
-            if (currentAuction.isEnded()) {
-                CurrencyMod.LOGGER.info("Auction checker detected that auction should have ended (auctionProcessed={})", auctionProcessed);
-                
-                // Double-check that the auction isn't already being processed
-                if (!auctionProcessed) {
-                    // End the auction manually
-                    try {
-                        CurrencyMod.LOGGER.info("Auction checker calling endAuction for item: {}", 
-                            currentAuction.getItem().getName().getString());
-                        endAuction();
-                    } catch (Exception e) {
-                        // Log any errors that might occur during auction ending
-                        CurrencyMod.LOGGER.error("Error during manual auction end check: ", e);
-                        
-                        // Force mark the auction as processed to avoid retrying
-                        auctionProcessed = true;
-                        CurrencyMod.LOGGER.info("Force marked auction as processed due to error");
+        // C-03 fix: marshal the entire check to the server thread so that
+        // currentAuction + auctionProcessed reads/writes never race with
+        // placeBid/cancelAuction/endAuction on the server thread. The old
+        // code read currentAuction + auctionProcessed on the scheduler thread
+        // and then called endAuction() directly on the scheduler thread --
+        // racing with any concurrent placeBid on the server thread.
+        server.execute(() -> {
+            // Check if there's an active auction
+            if (currentAuction != null && !auctionProcessed) {
+                // Check if the auction should have ended
+                if (currentAuction.isEnded()) {
+                    CurrencyMod.LOGGER.info("Auction checker detected that auction should have ended (auctionProcessed={})", auctionProcessed);
+                    
+                    // Double-check that the auction isn't already being processed
+                    if (!auctionProcessed) {
+                        // End the auction manually
+                        try {
+                            CurrencyMod.LOGGER.info("Auction checker calling endAuction for item: {}", 
+                                currentAuction.getItem().getName().getString());
+                            endAuction();
+                        } catch (Exception e) {
+                            // Log any errors that might occur during auction ending
+                            CurrencyMod.LOGGER.error("Error during manual auction end check: ", e);
+                            
+                            // Force mark the auction as processed to avoid retrying
+                            auctionProcessed = true;
+                            CurrencyMod.LOGGER.info("Force marked auction as processed due to error");
+                        }
+                    } else {
+                        CurrencyMod.LOGGER.info("Auction checker skipped ending auction because it's already processed");
                     }
                 } else {
-                    CurrencyMod.LOGGER.info("Auction checker skipped ending auction because it's already processed");
+                    // Log the current status for debugging
+                    long timeLeft = currentAuction.getTimeLeft();
+                    CurrencyMod.LOGGER.debug("Auction checker: auction active with {} seconds left", timeLeft);
                 }
-            } else {
-                // Log the current status for debugging
-                long timeLeft = currentAuction.getTimeLeft();
-                CurrencyMod.LOGGER.debug("Auction checker: auction active with {} seconds left", timeLeft);
             }
-        }
+        });
     }
     
     /**
@@ -194,6 +218,8 @@ public class AuctionManager {
      * @return true if the auction was created, false otherwise
      */
     public boolean createAuction(UUID sellerUuid, ItemStack item, double startingPrice, int durationMinutes) {
+        // C-03 fix: serialize against placeBid/cancelAuction/endAuction.
+        synchronized (auctionLock) {
         // Check if there's already an active auction
         if (currentAuction != null && !currentAuction.isEnded()) {
             return false;
@@ -256,6 +282,7 @@ public class AuctionManager {
         }
         
         return true;
+        } // synchronized (auctionLock)
     }
     
     /**
@@ -287,22 +314,34 @@ public class AuctionManager {
                     CurrencyMod.LOGGER.info("Auction end task triggered for: {}", 
                         auction.getItem().getName().getString());
                     
-                    // Check if the auction is the current one and not already ended
-                    if (currentAuction == auction && !auction.isEnded()) {
-                        CurrencyMod.LOGGER.info("Ending auction normally via scheduled task");
-                        endAuction();
-                    } else {
-                        CurrencyMod.LOGGER.warn("Auction end task triggered but auction is not current or already ended");
-                    }
+                    // C-03 fix: marshal endAuction to the server thread so it
+                    // never races with placeBid/cancelAuction. The old code
+                    // called endAuction() directly on the scheduler thread.
+                    // server.execute is a no-op (returns immediately) if we
+                    // are already on the server thread, so this is safe even
+                    // if the scheduler somehow runs on the server thread.
+                    server.execute(() -> {
+                        try {
+                            // Check if the auction is the current one and not already ended
+                            if (currentAuction == auction && !auction.isEnded()) {
+                                CurrencyMod.LOGGER.info("Ending auction normally via scheduled task");
+                                endAuction();
+                            } else {
+                                CurrencyMod.LOGGER.warn("Auction end task triggered but auction is not current or already ended");
+                            }
+                        } catch (Exception e) {
+                            CurrencyMod.LOGGER.error("Error in auction end task (server thread): ", e);
+                            
+                            // Make sure to reset the auction state even on error
+                            try {
+                                resetAuctionState();
+                            } catch (Exception ex) {
+                                CurrencyMod.LOGGER.error("Failed to reset auction state after error", ex);
+                            }
+                        }
+                    });
                 } catch (Exception e) {
-                    CurrencyMod.LOGGER.error("Error in auction end task: ", e);
-                    
-                    // Make sure to reset the auction state even on error
-                    try {
-                        resetAuctionState();
-                    } catch (Exception ex) {
-                        CurrencyMod.LOGGER.error("Failed to reset auction state after error", ex);
-                    }
+                    CurrencyMod.LOGGER.error("Error scheduling auction end task: ", e);
                 }
             },
             timeLeftSeconds,
@@ -553,6 +592,8 @@ public class AuctionManager {
      * End the current auction
      */
     public void endAuction() {
+        // C-03 fix: serialize against placeBid/cancelAuction/createAuction.
+        synchronized (auctionLock) {
         // Skip if there's no auction or it has already been processed
         if (currentAuction == null || auctionProcessed) {
             CurrencyMod.LOGGER.info("Skipping auction end: no auction or already processed (auctionProcessed={})", 
@@ -775,6 +816,7 @@ public class AuctionManager {
             // Always reset the auction state, even if there was an error
             resetAuctionState();
         }
+        } // synchronized (auctionLock)
     }
     
     /**
@@ -856,6 +898,8 @@ public class AuctionManager {
      * @return true if the bid was placed successfully, false otherwise
      */
     public boolean placeBid(UUID bidderUuid, double bidAmount) {
+        // C-03 fix: serialize against endAuction/cancelAuction/createAuction.
+        synchronized (auctionLock) {
         // Check if there is an active auction
         if (currentAuction == null) {
             CurrencyMod.LOGGER.info("Bid rejected: No active auction");
@@ -1025,6 +1069,7 @@ public class AuctionManager {
         }
         
         return true;
+        } // synchronized (auctionLock)
     }
     
     /**
@@ -1080,6 +1125,8 @@ public class AuctionManager {
      * @return true if the auction was canceled, false otherwise
      */
     public boolean cancelAuction(UUID playerUuid) {
+        // C-03 fix: serialize against endAuction/placeBid/createAuction.
+        synchronized (auctionLock) {
         // Check if there's an active auction
         if (currentAuction == null || currentAuction.isEnded()) {
             CurrencyMod.LOGGER.info("Cannot cancel auction: no auction or already ended");
@@ -1182,6 +1229,7 @@ public class AuctionManager {
         resetAuctionState();
         CurrencyMod.LOGGER.info("Auction successfully cancelled and reset");
         return true;
+        } // synchronized (auctionLock)
     }
     
     /**
