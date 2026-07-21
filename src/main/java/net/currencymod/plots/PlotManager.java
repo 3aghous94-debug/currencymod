@@ -399,15 +399,30 @@ public class PlotManager {
         List<Plot> plots = playerPlots.get(playerUuid);
         int totalTax = calculateTotalTax(plots);
 
+        // C-12 fix: clamp negative totalTax to 0.
+        // The COMMUNITY plot type's default tax is -10 (PlotType.java:93) and
+        // ModConfig.PlotConfig only seeds PERSONAL/FARM/BUSINESS/INDUSTRIAL,
+        // never COMMUNITY -- so the -10 default leaks through to runtime.
+        // Combined with the missing ownership cap (separate audit item), a
+        // player who buys N COMMUNITY plots receives N*10 currency per day
+        // unconditionally, even while offline. 100 plots == $1,000/day forever,
+        // break-even ~26 in-game days, pure profit thereafter. This is an
+        // unintended money-printing exploit, not a feature.
+        //
+        // Phase 1a fix per audit v3.0: treat any negative totalTax as 0.
+        // This is a behavior change: existing COMMUNITY plot owners who were
+        // receiving the unintended subsidy will stop receiving it. The audit
+        // recommends communicating this in the changelog and adding an in-game
+        // notice on first join after upgrade. Ownership cap + config-level
+        // validation are tracked as separate follow-up work.
         if (totalTax < 0) {
-            int subsidy = -totalTax;
-            CurrencyMod.getEconomyManager().addBalance(playerUuid, subsidy);
-            player.sendMessage(Text.literal("💵 Daily plot payment of ")
-                    .append(Text.literal("$" + subsidy).formatted(Formatting.GREEN))
-                    .append(Text.literal(" has been paid to you for your plots.").formatted(Formatting.WHITE)));
-            LOGGER.info("Paid ${} daily plot payment to {}", subsidy, player.getName().getString());
-            return true;
-        } else if (totalTax == 0) {
+            LOGGER.warn("Player {} had negative total tax of {} (likely from COMMUNITY plots); " +
+                "clamping to 0 to prevent money duplication exploit (C-12).",
+                player.getName().getString(), totalTax);
+            totalTax = 0;
+        }
+
+        if (totalTax == 0) {
             return true;
         }
 
