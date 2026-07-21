@@ -298,6 +298,40 @@ public class ShopDetector {
                                 }
                                 
                                 // Create the shop with the determined owner
+                                // C-08 fix: for admin shops, verify the
+                                // determined owner has OP permission level 2+.
+                                // The old code only checked the server-level
+                                // gate (areCommandBlocksEnabled() ||
+                                // getCurrentPlayerCount() <= 1), which is true
+                                // on any singleplayer world AND on any server
+                                // where command blocks are enabled (common for
+                                // survival servers). A non-OP player could
+                                // place an [AdminBuy]/[AdminSell] sign and the
+                                // background scanner would auto-create an
+                                // unlimited-stock, unlimited-funds shop owned
+                                // by them -- an infinite-money sink.
+                                //
+                                // We check AFTER owner determination so we
+                                // have the UUID to look up. If the owner is
+                                // offline (signCreators returned a stale UUID,
+                                // or single-player loaded a world whose host
+                                // is offline), we cannot check permission --
+                                // in that case, skip creation rather than
+                                // trust the recorded owner. Single-player
+                                // mode (getCurrentPlayerCount() == 1) is the
+                                // exception: the host is always OP-equivalent.
+                                if (isAdminShop && server.getCurrentPlayerCount() > 1) {
+                                    ServerPlayerEntity ownerPlayer = server.getPlayerManager().getPlayer(ownerUuid);
+                                    if (ownerPlayer == null || !ownerPlayer.hasPermissionLevel(2)) {
+                                        worldProcessedSigns.add(pos);
+                                        LOGGER.warn("C-08: refusing to auto-create admin shop at {} for player {} " +
+                                            "(offline or insufficient permission level); skipping. If this is a " +
+                                            "legitimate admin shop, an OP must right-click the sign to claim it.",
+                                            pos, ownerUuid);
+                                        continue;
+                                    }
+                                }
+                                
                                 ShopData shopData = createShop(world, pos, chestPos, ownerUuid, isBuyType, 
                                     shopInfo.itemName, shopInfo.quantity, shopInfo.price, isAdminShop);
                                 
