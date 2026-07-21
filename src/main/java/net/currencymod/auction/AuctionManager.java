@@ -886,10 +886,9 @@ public class AuctionManager {
             return true;
         }
 
-        // Create the bid
-        Bid bid = new Bid(bidderUuid, bidAmount);
-        
-        // Store previous top bidder if exists to refund them
+        // Store previous top bidder info BEFORE any state mutation (C-05 fix).
+        // We will attempt to deduct from the bidder FIRST and abort cleanly if
+        // the deduction fails, so no rollback path is needed.
         UUID previousTopBidderUUID = null;
         double previousBidAmount = 0;
         
@@ -898,15 +897,44 @@ public class AuctionManager {
             previousBidAmount = currentAuction.getCurrentBid().getBidAmount();
         }
 
-        // Set the new winning bid
-        currentAuction.placeBid(bidderUuid, bidAmount);
-        
-        // Log the bid
         String bidderName = getPlayerNameString(bidderUuid);
+
+        // Deduct the bid amount from the bidder FIRST (C-05 fix).
+        // The pre-check at line 854 is a fast UX rejection path, but it is TOCTOU:
+        // a concurrent tax deduction (PlotManager scheduler, see C-01) or service
+        // charge can reduce the balance between the pre-check and the deduction.
+        // removeBalance returns -1 on insufficient funds; we must check it and
+        // abort cleanly WITHOUT mutating currentAuction or refunding the previous
+        // bidder. Otherwise the bid would be recorded as the winning bid without
+        // the bidder paying anything (free bid), and at auction end the seller
+        // would be paid from money that was never deposited.
+        double deductResult = economyManager.removeBalance(bidderUuid, bidAmount);
+        if (deductResult < 0) {
+            CurrencyMod.LOGGER.info(
+                "Bid rejected: UUID {} failed escrow deduction of {} (balance dropped below bid " +
+                "between pre-check and removeBalance, likely due to concurrent tax/service charge)",
+                bidderUuid, bidAmount);
+            ServerPlayerEntity bidder = server.getPlayerManager().getPlayer(bidderUuid);
+            if (bidder != null) {
+                bidder.sendMessage(Text.literal("§6[Auction] §cYour bid of §a" + bidAmount +
+                    " §ccould not be placed: insufficient funds at escrow time."));
+            }
+            return false;
+        }
+        CurrencyMod.LOGGER.info("Escrowed {} from UUID {} (new balance: {})",
+            bidAmount, bidderUuid, deductResult);
+
+        // Deduction succeeded — now it is safe to mutate auction state.
+        // Set the new winning bid.
+        currentAuction.placeBid(bidderUuid, bidAmount);
+
         CurrencyMod.LOGGER.info("{} placed a bid of {} on auction of {}", 
             bidderName, bidAmount, currentAuction.getItem().getName().getString());
 
-        // Refund the previous top bidder if there was one
+        // Refund the previous top bidder if there was one (their escrow was taken
+        // at their own placeBid time). This refund happens AFTER the new bidder's
+        // deduction succeeded, so we never end up in a state where we refunded
+        // the previous bidder but failed to take the new bidder's money.
         if (previousTopBidderUUID != null && !previousTopBidderUUID.equals(bidderUuid)) {
             economyManager.addBalance(previousTopBidderUUID, previousBidAmount);
             CurrencyMod.LOGGER.info("Refunded {} currency to previous top bidder", previousBidAmount);
@@ -918,9 +946,6 @@ public class AuctionManager {
                     previousBidAmount + " §ehas been refunded."));
             }
         }
-
-        // Deduct the currency from the bidder
-        economyManager.removeBalance(bidderUuid, bidAmount);
 
         // Broadcast the new bid to all players
         if (server != null) {
