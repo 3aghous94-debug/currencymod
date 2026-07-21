@@ -58,6 +58,7 @@ public class AuctionManager {
     private static final double BID_INCREMENT_PERCENT = 0.05; // 5% minimum increase
     private static final double MIN_BID_INCREMENT = 1.0; // Minimum $1 increase
     private static final String PENDING_ITEMS_FILE = "currency_mod/auction_pending_items.json";
+    private static final String CURRENT_AUCTION_FILE = "currency_mod/current_auction.json";
     
     // Add a check interval (in seconds) to manually verify auction end times
     private static final int AUCTION_CHECK_INTERVAL = 5;
@@ -198,6 +199,10 @@ public class AuctionManager {
         this.economyManager = CurrencyMod.getEconomyManager();
         // Load any pending items when the server starts
         loadPendingItems(server);
+        // N2-C-02 fix: recover any orphaned auction from a mid-auction crash
+        // BEFORE the auction checker starts processing. This refunds the
+        // bidder (if any) and queues the item for return to the seller.
+        loadCurrentAuctionAndRecoverOrphans();
     }
     
     /**
@@ -281,6 +286,9 @@ public class AuctionManager {
             broadcastAuctionMessage(enchantMessage);
         }
         
+        // N2-C-02 fix: persist auction state so a mid-auction server crash
+        // does not permanently destroy the seller's item.
+        saveCurrentAuction();
         return true;
         } // synchronized (auctionLock)
     }
@@ -815,6 +823,9 @@ public class AuctionManager {
         } finally {
             // Always reset the auction state, even if there was an error
             resetAuctionState();
+            // N2-C-02 fix: clear the persisted auction state since the
+            // auction has ended and reset.
+            saveCurrentAuction();
         }
         } // synchronized (auctionLock)
     }
@@ -1068,6 +1079,9 @@ public class AuctionManager {
             }
         }
         
+        // N2-C-02 fix: persist the new bid state so a mid-auction crash
+        // can refund the correct bidder on restart.
+        saveCurrentAuction();
         return true;
         } // synchronized (auctionLock)
     }
@@ -1099,6 +1113,12 @@ public class AuctionManager {
         currentAuction.extendEndTime(seconds);
         CurrencyMod.LOGGER.info("Extended auction by {} seconds", seconds);
         
+        // N2-C-02 fix: persist the new end time so a mid-auction crash
+        // uses the extended end time on restart (though the recovery
+        // path always forcibly ends, the persisted state is useful for
+        // any future 'resume' implementation).
+        saveCurrentAuction();
+        
         // Cancel the current end task
         if (endAuctionTask != null && !endAuctionTask.isDone()) {
             CurrencyMod.LOGGER.info("Cancelling existing auction end task for time extension");
@@ -1108,9 +1128,11 @@ public class AuctionManager {
         // Get the new time left
         long newTimeLeft = currentAuction.getTimeLeft();
         
-        // Schedule the new end task
+        // Schedule the new end task. C-03 fix: marshal to the server
+        // thread so endAuction never races with placeBid/cancelAuction.
+        // The original C-03 fix missed this third call site.
         endAuctionTask = scheduler.schedule(
-            this::endAuction,
+            () -> server.execute(this::endAuction),
             newTimeLeft,
             TimeUnit.SECONDS
         );
@@ -1228,6 +1250,9 @@ public class AuctionManager {
         CurrencyMod.LOGGER.info("About to reset auction state after cancellation");
         resetAuctionState();
         CurrencyMod.LOGGER.info("Auction successfully cancelled and reset");
+        // N2-C-02 fix: clear the persisted auction state since the
+        // auction has been cancelled and reset.
+        saveCurrentAuction();
         return true;
         } // synchronized (auctionLock)
     }
@@ -1848,6 +1873,190 @@ public class AuctionManager {
             CurrencyMod.LOGGER.info("Loaded {} pending auction items", pendingItemReturns.size());
         } catch (Exception e) {
             CurrencyMod.LOGGER.error("Failed to load pending auction items", e);
+        }
+    }
+    
+    /**
+     * N2-C-02 fix: persist the in-memory currentAuction (seller UUID, item,
+     * starting price, end time, current bid) to currency_mod/current_auction.json.
+     * Called on every state change (createAuction, placeBid, extendAuctionTime,
+     * cancelAuction, endAuction) so a mid-auction server crash does not
+     * permanently destroy the seller's item and the high bidder's escrowed money.
+     *
+     * The item is serialized with the same Registries.ITEM.getId + count +
+     * displayName approach as savePendingItems (post C-07 fix). The current
+     * bid, if any, stores bidder UUID + amount so the startup orphaned-auction
+     * handler can refund the bidder if the auction is ended forcibly.
+     *
+     * If currentAuction is null (auction ended + reset), the file is overwritten
+     * with an empty JSON object so the next startup sees no orphaned auction.
+     */
+    public void saveCurrentAuction() {
+        if (server == null) {
+            CurrencyMod.LOGGER.warn("Cannot save current auction: server is null");
+            return;
+        }
+        
+        File auctionFile = FileUtil.getServerFile(server, CURRENT_AUCTION_FILE);
+        if (auctionFile == null) {
+            CurrencyMod.LOGGER.error("Failed to get current auction file path");
+            return;
+        }
+        
+        try {
+            JsonObject rootObject = new JsonObject();
+            
+            if (currentAuction != null && !currentAuction.isEnded()) {
+                rootObject.addProperty("sellerUuid", currentAuction.getSellerUuid().toString());
+                rootObject.addProperty("itemId", Registries.ITEM.getId(currentAuction.getItem().getItem()).toString());
+                rootObject.addProperty("count", currentAuction.getItem().getCount());
+                rootObject.addProperty("displayName", currentAuction.getItem().getName().getString());
+                rootObject.addProperty("startingPrice", currentAuction.getStartingPrice());
+                rootObject.addProperty("endTime", currentAuction.getEndTime());
+                rootObject.addProperty("ended", currentAuction.isEnded());
+                
+                if (currentAuction.getCurrentBid() != null) {
+                    JsonObject bidObject = new JsonObject();
+                    bidObject.addProperty("bidderUuid", currentAuction.getCurrentBid().getBidderUuid().toString());
+                    bidObject.addProperty("bidAmount", currentAuction.getCurrentBid().getBidAmount());
+                    rootObject.add("currentBid", bidObject);
+                }
+            }
+            // else: empty object -- auction has ended or never existed
+            
+            Gson gson = new GsonBuilder().setPrettyPrinting().create();
+            String jsonContent = gson.toJson(rootObject);
+            
+            boolean success = FileUtil.safeWriteToFile(server, auctionFile, jsonContent);
+            if (success) {
+                CurrencyMod.LOGGER.debug("Saved current auction state to {}", CURRENT_AUCTION_FILE);
+            } else {
+                CurrencyMod.LOGGER.error("Failed to save current auction state to {}", CURRENT_AUCTION_FILE);
+            }
+        } catch (Exception e) {
+            CurrencyMod.LOGGER.error("Error saving current auction state", e);
+        }
+    }
+    
+    /**
+     * N2-C-02 fix: load any persisted currentAuction from disk and process
+     * orphaned auctions (mid-auction server crash recovery).
+     *
+     * If the file contains a non-ended auction, we treat it as orphaned: the
+     * auction scheduler did not fire cleanly, so we cannot trust the in-memory
+     * state. The safest recovery is to immediately end the auction:
+     *   - If there was a current bid: refund the bidder (their escrow was
+     *     already deducted and persisted in economy.json at placeBid time).
+     *   - Return the item to the seller via pendingItemReturns (so it gets
+     *     delivered when the seller next logs in, matching the existing
+     *     offline-seller pattern).
+     *   - Clear the persisted auction file so we don't re-process on next start.
+     *
+     * We do NOT attempt to resume the auction (re-arm endAuctionTask with the
+     * remaining time) because the audit notes that as a secondary option, but
+     * resuming is riskier: the item may have been partially delivered, the
+     * scheduler state is unknown, and the auction may have actually ended
+     * during the crash window. Forcibly ending + refunding is the conservative
+     * choice that never duplicates or destroys assets.
+     */
+    private void loadCurrentAuctionAndRecoverOrphans() {
+        if (server == null) {
+            return;
+        }
+        
+        File worldDir = server.getRunDirectory().toFile();
+        File auctionFile = new File(worldDir, CURRENT_AUCTION_FILE);
+        
+        if (!auctionFile.exists()) {
+            CurrencyMod.LOGGER.info("No persisted current auction file found; nothing to recover");
+            return;
+        }
+        
+        try (FileReader reader = new FileReader(auctionFile)) {
+            Gson gson = new GsonBuilder().create();
+            JsonObject rootObject = gson.fromJson(reader, JsonObject.class);
+            
+            if (rootObject == null || rootObject.size() == 0) {
+                CurrencyMod.LOGGER.info("Persisted current auction file is empty; nothing to recover");
+                return;
+            }
+            
+            // We have an orphaned auction. Recover it conservatively.
+            CurrencyMod.LOGGER.warn("N2-C-02 recovery: detected orphaned auction in {}; processing forced end",
+                CURRENT_AUCTION_FILE);
+            
+            // 1. Refund the current bidder if there was one.
+            if (rootObject.has("currentBid") && rootObject.get("currentBid").isJsonObject()) {
+                JsonObject bidObject = rootObject.getAsJsonObject("currentBid");
+                try {
+                    UUID bidderUuid = UUID.fromString(bidObject.get("bidderUuid").getAsString());
+                    double bidAmount = bidObject.get("bidAmount").getAsDouble();
+                    economyManager.addBalance(bidderUuid, bidAmount);
+                    CurrencyMod.LOGGER.warn("N2-C-02 recovery: refunded ${} to bidder {} (orphaned auction escrow)",
+                        bidAmount, bidderUuid);
+                    
+                    // Notify the bidder if they're online.
+                    ServerPlayerEntity bidder = server.getPlayerManager().getPlayer(bidderUuid);
+                    if (bidder != null) {
+                        bidder.sendMessage(Text.literal("§6[Auction] §eThe auction you bid on was interrupted by a " +
+                            "server restart. Your bid of §a" + bidAmount + " §ehas been refunded."));
+                    }
+                } catch (Exception refundEx) {
+                    CurrencyMod.LOGGER.error("N2-C-02 recovery: failed to refund bidder", refundEx);
+                }
+            }
+            
+            // 2. Return the item to the seller via pendingItemReturns.
+            if (rootObject.has("sellerUuid") && rootObject.has("itemId")) {
+                try {
+                    UUID sellerUuid = UUID.fromString(rootObject.get("sellerUuid").getAsString());
+                    String itemIdStr = rootObject.get("itemId").getAsString();
+                    int count = rootObject.has("count") ? rootObject.get("count").getAsInt() : 1;
+                    String displayName = rootObject.has("displayName") ?
+                        rootObject.get("displayName").getAsString() : "Unknown Item";
+                    
+                    Item resolvedItem = null;
+                    try {
+                        Identifier itemId = Identifier.of(itemIdStr);
+                        resolvedItem = Registries.ITEM.get(itemId);
+                    } catch (Exception idEx) {
+                        CurrencyMod.LOGGER.warn("N2-C-02 recovery: invalid itemId '{}' for seller {}; attempting displayName recovery",
+                            itemIdStr, sellerUuid);
+                    }
+                    
+                    ItemStack itemToReturn;
+                    if (resolvedItem != null && resolvedItem != Items.AIR) {
+                        itemToReturn = new ItemStack(resolvedItem, count);
+                    } else {
+                        // Fall back to displayName-based recovery (same logic as
+                        // loadPendingItems post-C-07 fix).
+                        itemToReturn = recoverItemByDisplayName(displayName, count);
+                    }
+                    
+                    if (!itemToReturn.isEmpty()) {
+                        pendingItemReturns.put(sellerUuid, itemToReturn);
+                        CurrencyMod.LOGGER.warn("N2-C-02 recovery: queued {}x {} for return to seller {} (orphaned auction)",
+                            count, displayName, sellerUuid);
+                    } else {
+                        CurrencyMod.LOGGER.error("N2-C-02 recovery: could not resolve item '{}' for seller {}; item is permanently lost",
+                            displayName, sellerUuid);
+                    }
+                } catch (Exception itemEx) {
+                    CurrencyMod.LOGGER.error("N2-C-02 recovery: failed to queue item return to seller", itemEx);
+                }
+            }
+            
+            // 3. Save the updated pendingItemReturns (so the queued item
+            //    survives a second restart) and clear the auction file.
+            savePendingItems(server);
+            
+            // Clear the persisted auction file by writing an empty object.
+            // (saveCurrentAuction would write an empty object if currentAuction
+            // is null, which it is at this point in startup.)
+            FileUtil.safeWriteToFile(server, auctionFile, "{}");
+            CurrencyMod.LOGGER.info("N2-C-02 recovery complete; auction file cleared");
+        } catch (Exception e) {
+            CurrencyMod.LOGGER.error("Failed to load/recover persisted current auction", e);
         }
     }
     
